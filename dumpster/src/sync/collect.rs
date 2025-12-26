@@ -173,6 +173,12 @@ pub fn notify_dropped_gc() {
         }
     });
 
+    // Don't trigger nested collection - this prevents deadlock when Gc values
+    // are dropped during an ongoing collection operation.
+    if CLEANING.with(|c| c.get()) {
+        return;
+    }
+
     let collect_cond = unsafe {
         // SAFETY: we only ever store collection conditions in the collect-condition box
         transmute::<*mut (), CollectCondition>(
