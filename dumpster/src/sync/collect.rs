@@ -186,7 +186,9 @@ pub fn notify_dropped_gc() {
         )
     };
     if collect_cond(&CollectInfo { _private: () }) {
-        GARBAGE_TRUCK.collect_all();
+        // Use non-blocking try_collect_all to avoid thread contention.
+        // If another thread is already collecting, we skip - they'll handle it.
+        GARBAGE_TRUCK.try_collect_all();
     }
 }
 
@@ -351,11 +353,28 @@ impl GarbageTruck {
         }
     }
 
+    /// Non-blocking variant of collect_all.
+    /// If another thread is already collecting, this returns immediately without doing anything.
+    /// This prevents thread contention when multiple threads try to trigger collection.
+    fn try_collect_all(&self) {
+        // Try to acquire the write lock without blocking.
+        // If we can't get it, another thread is already collecting - skip.
+        let Some(collecting_guard) = self.collecting_lock.try_write() else {
+            return;
+        };
+        self.collect_all_with_guard(collecting_guard);
+    }
+
     /// Search through the set of existing allocations which have been marked inaccessible, and see
     /// if they are inaccessible.
     /// If so, drop those allocations.
     fn collect_all(&self) {
         let collecting_guard = self.collecting_lock.write();
+        self.collect_all_with_guard(collecting_guard);
+    }
+
+    /// Internal implementation of collect_all that takes an already-acquired lock guard.
+    fn collect_all_with_guard(&self, collecting_guard: parking_lot::RwLockWriteGuard<'_, ()>) {
         self.n_gcs_dropped.store(0, Ordering::Relaxed);
 
         let to_collect = take(&mut **self.contents.lock());
