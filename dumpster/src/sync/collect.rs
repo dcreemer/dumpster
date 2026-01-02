@@ -139,7 +139,21 @@ thread_local! {
     /// This cannot be stored in `DUMPSTER` because otherwise it would cause weird use-after-drop
     /// behavior.
     static CLEANING: Cell<bool> = const { Cell::new(false) };
+
+    /// Thread-local counter for GCs created on this thread.
+    /// Periodically flushed to global counter to reduce contention.
+    static TL_GCS_CREATED: Cell<usize> = const { Cell::new(0) };
+
+    /// Thread-local counter for GCs dropped on this thread.
+    /// Periodically flushed to global counter to reduce contention.
+    static TL_GCS_DROPPED: Cell<usize> = const { Cell::new(0) };
+
+    /// Thread-local counter for operations since last flush.
+    static TL_OPS_SINCE_FLUSH: Cell<usize> = const { Cell::new(0) };
 }
+
+/// How often to flush thread-local counters to global.
+const FLUSH_INTERVAL: usize = 10_000;
 
 #[cfg(loom)]
 thread_local! {
@@ -163,6 +177,43 @@ pub fn collect_all_await() {
 ///
 /// This may trigger a linear-time cleanup of all allocations, but this will be guaranteed to
 /// occur with less-than-linear frequency, so it's always O(1).
+#[cfg(not(loom))]
+pub fn notify_dropped_gc() {
+    // Use thread-local counter to avoid global atomic contention
+    // Note: drops decrement existing, so we track separately and compute delta on flush
+    TL_GCS_DROPPED.with(|dropped| {
+        dropped.set(dropped.get() + 1);
+    });
+    maybe_flush();
+
+    DUMPSTER.with(|dumpster| {
+        dumpster.n_drops.set(dumpster.n_drops.get() + 1);
+        if dumpster.is_full() {
+            dumpster.deliver_to(&GARBAGE_TRUCK);
+        }
+    });
+
+    // Don't trigger nested collection - this prevents deadlock when Gc values
+    // are dropped during an ongoing collection operation.
+    if CLEANING.with(|c| c.get()) {
+        return;
+    }
+
+    let collect_cond = unsafe {
+        // SAFETY: we only ever store collection conditions in the collect-condition box
+        transmute::<*mut (), CollectCondition>(
+            GARBAGE_TRUCK.collect_condition.load(Ordering::Relaxed),
+        )
+    };
+    if collect_cond(&CollectInfo { _private: () }) {
+        // Use non-blocking try_collect_all to avoid thread contention.
+        // If another thread is already collecting, we skip - they'll handle it.
+        GARBAGE_TRUCK.try_collect_all();
+    }
+}
+
+/// Notify that a `Gc` was destroyed (loom version - uses global atomics).
+#[cfg(loom)]
 pub fn notify_dropped_gc() {
     GARBAGE_TRUCK.n_gcs_existing.fetch_sub(1, Ordering::Relaxed);
     GARBAGE_TRUCK.n_gcs_dropped.fetch_add(1, Ordering::Relaxed);
@@ -192,7 +243,68 @@ pub fn notify_dropped_gc() {
     }
 }
 
+/// Flush thread-local counters to global counters.
+/// Called periodically to reduce contention while maintaining accurate counts.
+#[cfg(not(loom))]
+fn flush_thread_local_counters() {
+    let created = TL_GCS_CREATED.with(|c| {
+        let n = c.get();
+        c.set(0);
+        n
+    });
+    let dropped = TL_GCS_DROPPED.with(|d| {
+        let n = d.get();
+        d.set(0);
+        n
+    });
+
+    // Update n_gcs_existing with net delta (created - dropped)
+    if created > dropped {
+        GARBAGE_TRUCK
+            .n_gcs_existing
+            .fetch_add(created - dropped, Ordering::Relaxed);
+    } else if dropped > created {
+        GARBAGE_TRUCK
+            .n_gcs_existing
+            .fetch_sub(dropped - created, Ordering::Relaxed);
+    }
+
+    // Update n_gcs_dropped
+    if dropped > 0 {
+        GARBAGE_TRUCK
+            .n_gcs_dropped
+            .fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    TL_OPS_SINCE_FLUSH.with(|ops| ops.set(0));
+}
+
+/// Check if we should flush thread-local counters.
+#[cfg(not(loom))]
+#[inline]
+fn maybe_flush() {
+    TL_OPS_SINCE_FLUSH.with(|ops| {
+        let n = ops.get() + 1;
+        if n >= FLUSH_INTERVAL {
+            flush_thread_local_counters();
+        } else {
+            ops.set(n);
+        }
+    });
+}
+
 /// Notify that a [`Gc`] was created, and increment the number of total existing `Gc`s.
+#[cfg(not(loom))]
+pub fn notify_created_gc() {
+    // Use thread-local counter to avoid global atomic contention
+    TL_GCS_CREATED.with(|created| {
+        created.set(created.get() + 1);
+    });
+    maybe_flush();
+}
+
+/// Notify that a [`Gc`] was created, and increment the number of total existing `Gc`s.
+#[cfg(loom)]
 pub fn notify_created_gc() {
     GARBAGE_TRUCK.n_gcs_existing.fetch_add(1, Ordering::Relaxed);
 }
